@@ -75,6 +75,9 @@ final class StreamReceiver: ObservableObject {
     @Published private(set) var keyboardForwardingAvailable = false
     // The iOS scene clears this immediately when it loses focus.
     var keyboardForeground = true
+    var keyboardForwardingEnabled: Bool {
+        UserDefaults.standard.object(forKey: "forwardKeyboard") as? Bool ?? true
+    }
     @Published var videoSize = CGSize.zero   // for touch coordinate mapping
     @Published var perf = PerfStats()
     // Compatibility signal from the connected Mac (issue #132). Nil = no signal.
@@ -188,6 +191,7 @@ final class StreamReceiver: ObservableObject {
     // hotspot anchor and size normalized against the Mac display. The anchor
     // and normalized coordinates use a TOP-LEFT origin (video space).
     var onCursor: ((_ x: Double, _ y: Double, _ visible: Bool) -> Void)?
+    var onKeyboardReset: (() -> Void)?
     var onCursorImage: ((_ image: CGImage, _ anchor: CGPoint, _ normSize: CGSize) -> Void)?
     // The video view attaches only once frames are on screen — usually AFTER
     // the connect-time sprite already arrived (the sender re-sends it only
@@ -659,6 +663,11 @@ final class StreamReceiver: ObservableObject {
                 }
             }
             conn.start(queue: self.queue)
+            self.queue.asyncAfter(deadline: .now() + 5) { [weak self] in
+                guard let self, conn !== self.connection,
+                      !self.pendingConnections.contains(where: { $0 === conn }) else { return }
+                conn.cancel()
+            }
         }
         secureListener?.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
@@ -695,8 +704,28 @@ final class StreamReceiver: ObservableObject {
                       self.tokensEqual(sent, stored) else {
                     conn.cancel(); return
                 }
-                self.transport = "WiFi"
-                self.adopt(conn, secure: true)
+                // A discovery probe reads hello and closes. Only a sender
+                // that replies with protocol data may replace a live stream.
+                guard self.pendingConnections.count < 8 else { conn.cancel(); return }
+                self.pendingConnections.append(conn)
+                self.sendHello(on: conn, includeCursorPort: false)
+                conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 18) {
+                    [weak self] first, _, _, _ in
+                    guard let self else { conn.cancel(); return }
+                    guard self.pendingConnections.contains(where: { $0 === conn }) else {
+                        conn.cancel(); return
+                    }
+                    self.pendingConnections.removeAll { $0 === conn }
+                    guard let first, !first.isEmpty else { conn.cancel(); return }
+                    self.transport = "WiFi"
+                    self.adopt(conn, greeted: true, initialData: first, secure: true)
+                }
+                self.queue.asyncAfter(deadline: .now() + 5) { [weak self] in
+                    guard let self, self.pendingConnections.contains(where: { $0 === conn })
+                    else { return }
+                    self.pendingConnections.removeAll { $0 === conn }
+                    conn.cancel()
+                }
             }
         }
     }
@@ -1212,13 +1241,19 @@ final class StreamReceiver: ObservableObject {
         sendControl(msg)
     }
 
-    func sendKey(usage: Int, down: Bool) {
+    func sendKey(usage: Int, down: Bool, modifiers: Int) {
         guard connected, keyboardForwardingAvailable, keyboardForeground,
-              videoSize != .zero, (0x04...0xe7).contains(usage) else { return }
-        sendControl(["type": "key", "usage": usage, "down": down])
+              keyboardForwardingEnabled,
+              videoSize != .zero,
+              (0x04...0x65).contains(usage) || (0xe0...0xe7).contains(usage),
+              (0...15).contains(modifiers)
+        else { return }
+        sendControl(["type": "key", "usage": usage, "down": down,
+                     "mods": modifiers])
     }
 
     func resetKeyboard() {
+        onKeyboardReset?()
         if connected, keyboardForwardingAvailable {
             sendControl(["type": "keyReset"])
         }
@@ -1740,6 +1775,7 @@ final class StreamReceiver: ObservableObject {
             if !value {
                 self.macProtocolVersion = WireProtocol.assumedWhenAbsent
                 self.keyboardForwardingAvailable = false
+                self.onKeyboardReset?()
             }
         }
         if !value { setStatus("Ready to connect") }

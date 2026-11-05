@@ -7,9 +7,6 @@ import Combine
 /// "iPad" or "iPhone" — so UI copy names the device the user is holding.
 let deviceKind = UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone"
 
-/// Landing page — hosts the Mac app download and explains the two-app setup.
-let macAppURL = URL(string: "https://opendisplay.app/")!
-
 @main
 struct OpenSidecarPhoneApp: App {
     var body: some Scene {
@@ -38,14 +35,12 @@ extension UIWindow {
 
 struct ReceiverScreen: View {
     @StateObject private var model = ReceiverModel()
-    @StateObject private var versionGate = VersionGate()
     @State private var showSettings = false
     @State private var showOnboarding = false
-    @State private var nagDismissed = false
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("showAnalytics") private var showAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
-    // First-run onboarding (issue #49): explain the Mac app is required.
+    // First-run onboarding explains the Windows sender and USB pairing.
     // Shown until either the user dismisses it or the device connects once.
     @AppStorage("hasConnectedBefore") private var hasConnectedBefore = false
     @AppStorage("onboardingDismissed") private var onboardingDismissed = false
@@ -53,19 +48,6 @@ struct ReceiverScreen: View {
     // Streaming = connected and the video format is known.
     private var isStreaming: Bool {
         model.receiver.connected && model.receiver.videoSize != .zero
-    }
-
-    // Below the force floor → present the blocking gate (issue #135). The
-    // fullScreenCover binding's setter is a no-op so the user can't dismiss it.
-    private var requiredUpdate: VersionGate.Update? {
-        if case let .required(update) = versionGate.status { return update }
-        return nil
-    }
-
-    // Soft nag: shown once per launch, dismissible.
-    private var recommendedUpdate: VersionGate.Update? {
-        if case let .recommended(update) = versionGate.status, !nagDismissed { return update }
-        return nil
     }
 
     var body: some View {
@@ -108,26 +90,8 @@ struct ReceiverScreen: View {
         }
         .onChange(of: showSettings) { showing in
             if showing { model.receiver.resetKeyboard() }
+            model.receiver.keyboardForeground = !showing
         }
-        // Below the force floor → blocking gate. Setter is a no-op: the user
-        // cannot dismiss it, only update.
-        .fullScreenCover(item: Binding(get: { requiredUpdate }, set: { _ in })) { update in
-            UpdateRequiredView(update: update)
-        }
-        // At/above the floor but behind the recommended version → soft nag.
-        .alert("Update available",
-               isPresented: Binding(get: { recommendedUpdate != nil },
-                                    set: { if !$0 { nagDismissed = true } })) {
-            Button("Update") {
-                if let update = recommendedUpdate { UIApplication.shared.open(update.url) }
-            }
-            Button("Later", role: .cancel) { nagDismissed = true }
-        } message: {
-            if let update = recommendedUpdate { Text(update.message) }
-        }
-        .task { await versionGate.check() }
-        // Merge the connected Mac's compatibility signal into the same gate.
-        .onReceive(model.receiver.$peerSignal) { versionGate.applyPeer($0) }
         .onReceive(NotificationCenter.default.publisher(for: .deviceDidShake)) { _ in
             showSettings = true
         }
@@ -202,7 +166,7 @@ struct IdleView: View {
                 .frame(width: 132)
 
             VStack(spacing: 6) {
-                Text("OpenDisplay")
+                Text("PadBridge Keyboard")
                     .font(.largeTitle.bold())
                 HStack(spacing: 8) {
                     Circle()
@@ -215,9 +179,9 @@ struct IdleView: View {
             }
 
             VStack(alignment: .leading, spacing: 14) {
-                HintRow("Plug in the USB cable and open OpenDisplay on your computer",
+                HintRow("Connect USB and open PadBridge on Windows to pair",
                         systemImage: "cable.connector")
-                HintRow("Or pick this \(deviceKind) under WiFi in OpenDisplay on your computer",
+                HintRow("After USB pairing, select this \(deviceKind) in PadBridge Wi-Fi",
                         systemImage: "wifi")
                 HintRow("Keep this app open. Streaming starts automatically.",
                         systemImage: "play.circle")
@@ -272,10 +236,9 @@ struct HintRow: View {
     }
 }
 
-// MARK: - First-run onboarding (the Mac app is required to connect)
+// MARK: - First-run onboarding
 
-/// Shown on first launch / while the device has never connected: OpenDisplay
-/// is two apps, and the iOS side is useless without the Mac app running.
+/// Shown on first launch until a Windows sender connects or the user dismisses it.
 struct OnboardingView: View {
     @Environment(\.dismiss) private var dismiss
     let onClose: () -> Void
@@ -293,7 +256,7 @@ struct OnboardingView: View {
                         Text("One more app to go")
                             .font(.title2.bold())
                             .multilineTextAlignment(.center)
-                        Text("OpenDisplay turns this \(deviceKind) into a second screen for your Mac. It needs the **OpenDisplay Mac app** running on a Mac connected by the same USB cable or on the same WiFi network.")
+                        Text("PadBridge Keyboard turns this \(deviceKind) into a second screen for Windows. Connect USB once to pair securely, then USB or Wi-Fi can carry the screen, touch and hardware keyboard.")
                             .font(.body)
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
@@ -301,8 +264,8 @@ struct OnboardingView: View {
                     }
 
                     VStack(alignment: .leading, spacing: 14) {
-                        HintRow("Install the OpenDisplay Mac app on your Mac", systemImage: "1.circle.fill")
-                        HintRow("Connect the \(deviceKind) by USB, or join the same WiFi", systemImage: "2.circle.fill")
+                        HintRow("Open PadBridge on your Windows computer", systemImage: "1.circle.fill")
+                        HintRow("Connect the \(deviceKind) by USB once to pair", systemImage: "2.circle.fill")
                         HintRow("Keep this app open. Streaming starts automatically.", systemImage: "3.circle.fill")
                     }
                     .font(.subheadline)
@@ -311,15 +274,7 @@ struct OnboardingView: View {
                     .background(Color(.secondarySystemBackground),
                                 in: RoundedRectangle(cornerRadius: 16))
 
-                    Link(destination: macAppURL) {
-                        Label("Get the Mac app", systemImage: "arrow.down.circle")
-                            .font(.headline)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 6)
-                    }
-                    .buttonStyle(.borderedProminent)
-
-                    Text("You can find this link again anytime in Settings — shake the \(deviceKind) to open it.")
+                    Text("Keep this app in the foreground while using the keyboard. Open Settings to turn keyboard forwarding off.")
                         .font(.footnote)
                         .foregroundStyle(.tertiary)
                         .multilineTextAlignment(.center)
@@ -347,10 +302,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage("showAnalytics") private var showAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
-    // Set once the user tapped "Rate on the App Store": the row is an
-    // invitation, not a permanent fixture.
-    @AppStorage("rateAppTapped") private var rateAppTapped = false
-    @Environment(\.openURL) private var openURL
+    @AppStorage("forwardKeyboard") private var forwardKeyboard = true
 
     private var version: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
@@ -359,22 +311,9 @@ struct SettingsView: View {
     var body: some View {
         AdaptiveNavigation {
             Form {
-                if !rateAppTapped {
-                    Section {
-                        Button {
-                            // Hide only once the App Store actually opened
-                            // (it can be restricted by Screen Time).
-                            openURL(AppStore.reviewURL) { accepted in
-                                if accepted { rateAppTapped = true }
-                            }
-                        } label: {
-                            Label("Rate OpenDisplay on the App Store", systemImage: "star")
-                        }
-                    }
-                }
-
                 Section("Status") {
-                    LabeledRow("Listening", value: "Port 9000")
+                    LabeledRow("Listening", value: "USB :9000 · TLS Wi-Fi :9001")
+                    LabeledRow("Wi-Fi pairing", value: PadBridgePairing.load() == nil ? "Pair over USB" : "Paired")
                     LabeledRow("Connection",
                                value: receiver.connected ? "Connected" : "Waiting for a computer")
                     if receiver.videoSize != .zero {
@@ -393,7 +332,18 @@ struct SettingsView: View {
                 } header: {
                     Text("Name")
                 } footer: {
-                    Text("Shown in the WiFi list of OpenDisplay on your computer. iOS hides this \(deviceKind)'s real name from apps, so set it here once.")
+                    Text("Shown in PadBridge's Wi-Fi list on Windows.")
+                }
+
+                Section {
+                    Toggle("Forward hardware keyboard to Windows", isOn: $forwardKeyboard)
+                        .onChange(of: forwardKeyboard) { enabled in
+                            if !enabled { receiver.resetKeyboard() }
+                        }
+                } header: {
+                    Text("Keyboard")
+                } footer: {
+                    Text("Only while this app is showing the second screen. Option → Alt, Command → Windows, Control → Ctrl. The trackpad stays on iPadOS.")
                 }
 
                 Section {
@@ -406,7 +356,7 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Button("Open iOS Settings for OpenDisplay") {
+                    Button("Open iOS Settings for PadBridge Keyboard") {
                         if let url = URL(string: UIApplication.openSettingsURLString) {
                             UIApplication.shared.open(url)
                         }
@@ -414,7 +364,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Permissions")
                 } footer: {
-                    Text("WiFi mode needs Local Network access. If your computer can't find this \(deviceKind), enable it under Settings → Privacy & Security → Local Network → OpenDisplay. USB mode works without it.")
+                    Text("Wi-Fi needs Local Network access for PadBridge Keyboard. USB works without it.")
                 }
 
                 Section {
@@ -430,9 +380,9 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Label("USB: plug in the cable and open OpenDisplay on your computer. It connects through the wire on its own (lowest latency).",
+                    Label("USB: connect the cable and select USB in PadBridge on Windows. The first connection pairs Wi-Fi.",
                           systemImage: "cable.connector")
-                    Label("WiFi: both devices on the same network, then pick this \(deviceKind) in OpenDisplay on your computer.",
+                    Label("Wi-Fi: after USB pairing, connect both devices to the same network and select this \(deviceKind) in PadBridge.",
                           systemImage: "wifi")
                     Label("Rotate the \(deviceKind) for a vertical second monitor.",
                           systemImage: "rotate.right")
@@ -440,14 +390,6 @@ struct SettingsView: View {
                           systemImage: "hand.tap")
                 } header: {
                     Text("How to connect")
-                }
-
-                Section {
-                    Link(destination: macAppURL) {
-                        Label("Get the Mac app", systemImage: "arrow.down.circle")
-                    }
-                } footer: {
-                    Text("OpenDisplay needs the Mac app running on a Mac on the same cable or WiFi network. Download it here if you haven't yet.")
                 }
 
                 Section("About") {
@@ -461,13 +403,9 @@ struct SettingsView: View {
                     Link(destination: URL(string: "https://ko-fi.com/peetzweg")!) {
                         Label("Support OpenDisplay on Ko-fi", systemImage: "cup.and.saucer")
                     }
-                    // Permanent counterpart of the one-time row at the top.
-                    Link(destination: AppStore.reviewURL) {
-                        Label("Rate on the App Store", systemImage: "star")
-                    }
                 }
             }
-            .navigationTitle("OpenDisplay")
+            .navigationTitle("PadBridge Keyboard")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -790,6 +728,7 @@ struct VideoLayerView: UIViewRepresentable {
         view.clipsToBounds = true   // a held frame can be larger than a folded screen
         view.isMultipleTouchEnabled = true
         view.receiver = receiver
+        receiver.onKeyboardReset = { [weak view] in view?.clearKeys() }
 
         Log.info("video view: metal=\(useMetal)")
         if useMetal, let renderer = MetalVideoRenderer() {
@@ -855,6 +794,38 @@ struct VideoLayerView: UIViewRepresentable {
         weak var receiver: StreamReceiver?
         var metalRenderer: MetalVideoRenderer?
         let inputEngine = InputCaptureEngine()
+        private var heldUsages = Set<Int>()
+        private var repeatTimers: [Int: DispatchSourceTimer] = [:]
+        private var repeatModifiers: [Int: Int] = [:]
+
+        func clearKeys() {
+            for timer in repeatTimers.values { timer.cancel() }
+            repeatTimers.removeAll()
+            repeatModifiers.removeAll()
+            heldUsages.removeAll()
+        }
+
+        private func stopRepeat(_ usage: Int) {
+            repeatTimers.removeValue(forKey: usage)?.cancel()
+        }
+
+        private func startRepeat(_ usage: Int) {
+            guard usage < 0xe0, usage != 0x39, usage != 0x46 else { return }
+            let timer = DispatchSource.makeTimerSource(queue: .main)
+            timer.schedule(deadline: .now() + 0.48, repeating: .milliseconds(50))
+            timer.setEventHandler { [weak self] in
+                guard let self, self.heldUsages.contains(usage),
+                      let receiver = self.receiver, receiver.connected,
+                      receiver.keyboardForeground, receiver.keyboardForwardingEnabled else {
+                    self?.stopRepeat(usage)
+                    return
+                }
+                receiver.sendKey(usage: usage, down: true,
+                                 modifiers: self.repeatModifiers[usage] ?? 0)
+            }
+            repeatTimers[usage] = timer
+            timer.resume()
+        }
 
         override var canBecomeFirstResponder: Bool { true }
 
@@ -869,18 +840,40 @@ struct VideoLayerView: UIViewRepresentable {
 
         private func forward(_ presses: Set<UIPress>, down: Bool) -> Set<UIPress> {
             guard let receiver, receiver.connected,
-                  receiver.keyboardForwardingAvailable, receiver.keyboardForeground else {
+                  receiver.keyboardForwardingAvailable, receiver.keyboardForeground,
+                  receiver.keyboardForwardingEnabled else {
                 return presses
             }
             var unhandled = Set<UIPress>()
             for press in presses {
                 guard let key = press.key else { unhandled.insert(press); continue }
                 let usage = Int(key.keyCode.rawValue)
-                guard (0x04...0xe7).contains(usage) else {
+                guard (0x04...0x65).contains(usage) || (0xe0...0xe7).contains(usage) else {
                     unhandled.insert(press)
                     continue
                 }
-                receiver.sendKey(usage: usage, down: down)
+                let flags = key.modifierFlags
+                var modifiers = 0
+                if flags.contains(.shift) { modifiers |= 1 }
+                if flags.contains(.control) { modifiers |= 2 }
+                if flags.contains(.alternate) { modifiers |= 4 }
+                if flags.contains(.command) { modifiers |= 8 }
+                if down {
+                    repeatModifiers[usage] = modifiers
+                    if heldUsages.contains(usage) {
+                        // Some iPadOS versions deliver their own repeated
+                        // key-down events. Use those instead of our timer.
+                        stopRepeat(usage)
+                    } else {
+                        heldUsages.insert(usage)
+                        startRepeat(usage)
+                    }
+                } else {
+                    heldUsages.remove(usage)
+                    stopRepeat(usage)
+                }
+                receiver.sendKey(usage: usage, down: down, modifiers: modifiers)
+                if !down { repeatModifiers.removeValue(forKey: usage) }
             }
             return unhandled
         }
