@@ -45,6 +45,7 @@ final class VersionGate: ObservableObject {
     private var peerStatus: Status = .ok
 
     private let manifestURL = URL(string: "https://opendisplay.app/ios-version.json")!
+    private let macAppURL = URL(string: "https://opendisplay.app")!
 
     /// The running app's marketing version. Local/dev builds ship "0.0.0"
     /// (the project.yml default), which we treat as "skip the gate".

@@ -35,9 +35,10 @@ enum PadBridgePairing {
         let options = [kSecImportExportPassphrase as String: password]
         guard SecPKCS12Import(p12 as CFData, options as CFDictionary, &items) == errSecSuccess,
               let values = items as? [[String: Any]], let first = values.first,
-              let identity = first[kSecImportItemIdentity as String] as? SecIdentity
+              let rawIdentity = first[kSecImportItemIdentity as String],
+              CFGetTypeID(rawIdentity as CFTypeRef) == SecIdentityGetTypeID()
         else { return nil }
-        return identity
+        return rawIdentity as! SecIdentity
     }
 
     static func identity() -> SecIdentity? {
