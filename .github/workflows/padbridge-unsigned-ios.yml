@@ -1,0 +1,44 @@
+name: PadBridge unsigned iPad build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feature/keyboard-secure-wifi]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: xcode-27
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Build unsigned iPad app
+        run: |
+          xcodebuild build \
+            -project OpenSidecar.xcodeproj \
+            -scheme OpenSidecariOS \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/ios \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+      - name: Package for local signing
+        run: |
+          mkdir -p build/package/Payload
+          cp -R build/ios/Build/Products/Release-iphoneos/OpenSidecariOS.app \
+            build/package/Payload/PadBridgeKeyboard.app
+          cd build/package
+          zip -q -r PadBridgeKeyboard-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PadBridgeKeyboard-unsigned
+          path: build/package/PadBridgeKeyboard-unsigned.ipa
+          retention-days: 7

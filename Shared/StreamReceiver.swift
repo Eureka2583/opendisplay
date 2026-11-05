@@ -19,6 +19,9 @@ import CoreMedia
 import VideoToolbox
 import QuartzCore
 import ImageIO
+#if os(iOS)
+import Security
+#endif
 
 /// One-second window of pipeline health, plus per-frame timing samples for
 /// the performance overlay graph.
@@ -69,6 +72,9 @@ final class StreamReceiver: ObservableObject {
     @Published var status = "Starting…"
     @Published var fps = 0
     @Published var connected = false
+    @Published private(set) var keyboardForwardingAvailable = false
+    // The iOS scene clears this immediately when it loses focus.
+    var keyboardForeground = true
     @Published var videoSize = CGSize.zero   // for touch coordinate mapping
     @Published var perf = PerfStats()
     // Compatibility signal from the connected Mac (issue #132). Nil = no signal.
@@ -82,7 +88,12 @@ final class StreamReceiver: ObservableObject {
 
     private var listener: NWListener?
     private var listenerHealthy = false
+    #if os(iOS)
+    private var secureListener: NWListener?
+    private var secureListenerHealthy = false
+    #endif
     private var connection: NWConnection?
+    private var secureSession = false
     // Cursor side channel: UDP on port+1. Cursor positions ride TCP behind
     // multi-hundred-KB video frames, so over WiFi one late frame stalls the
     // cursor with it (head-of-line blocking). UDP datagrams skip that queue.
@@ -273,7 +284,12 @@ final class StreamReceiver: ObservableObject {
         var txt = NWTXTRecord()
         txt["id"] = Self.installID
         txt["pv"] = String(WireProtocol.version)   // issue #132
-        return NWListener.Service(name: serviceName, type: "_opensidecar._tcp",
+        #if os(iOS)
+        let serviceType = "_padbridge-secure._tcp"
+        #else
+        let serviceType = "_opensidecar._tcp"
+        #endif
+        return NWListener.Service(name: serviceName, type: serviceType,
                                   domain: nil, txtRecord: txt)
     }
 
@@ -285,9 +301,14 @@ final class StreamReceiver: ObservableObject {
             guard resolved != self.serviceName else { return }
             self.serviceName = resolved
             if self.listener != nil {
+                #if os(macOS)
                 self.listener?.service = self.advertisedService
+                #endif
                 Log.info("re-advertising as \"\(resolved)\"")
             }
+            #if os(iOS)
+            self.secureListener?.service = self.advertisedService
+            #endif
         }
     }
 
@@ -368,6 +389,9 @@ final class StreamReceiver: ObservableObject {
         self.port = port
         queue.async {
             self.startListener()
+            #if os(iOS)
+            self.startSecureListener()
+            #endif
             self.armLivenessTimers()
         }
     }
@@ -394,9 +418,13 @@ final class StreamReceiver: ObservableObject {
     /// or enterSleep deliberately took it down on lock).
     func ensureListening() {
         queue.async {
-            guard !self.listenerHealthy else { return }
-            Log.info("listener not healthy — restarting")
-            self.restartListener()
+            if !self.listenerHealthy {
+                Log.info("listener not healthy — restarting")
+                self.restartListener()
+            }
+            #if os(iOS)
+            if !self.secureListenerHealthy { self.startSecureListener() }
+            #endif
         }
     }
 
@@ -454,6 +482,11 @@ final class StreamReceiver: ObservableObject {
                 self.listener?.cancel()
                 self.listener = nil
                 self.listenerHealthy = false
+                #if os(iOS)
+                self.secureListener?.cancel()
+                self.secureListener = nil
+                self.secureListenerHealthy = false
+                #endif
                 self.stopCursorListener()
                 self.setConnected(false)
                 self.setStatus(status)
@@ -479,6 +512,9 @@ final class StreamReceiver: ObservableObject {
         listener = nil
         listenerHealthy = false
         startListener()
+        #if os(iOS)
+        if !secureListenerHealthy { startSecureListener() }
+        #endif
     }
 
     /// The UDP cursor listener follows the TCP listener's lifecycle: created
@@ -588,6 +624,92 @@ final class StreamReceiver: ObservableObject {
         applyCursor(obj)
     }
 
+    #if os(iOS)
+    private func startSecureListener() {
+        secureListener?.cancel()
+        secureListener = nil
+        secureListenerHealthy = false
+        guard let secIdentity = PadBridgePairing.identity(),
+              let identity = sec_identity_create(secIdentity) else { return }
+        let tls = NWProtocolTLS.Options()
+        sec_protocol_options_set_min_tls_protocol_version(
+            tls.securityProtocolOptions, .TLSv13)
+        sec_protocol_options_set_max_tls_protocol_version(
+            tls.securityProtocolOptions, .TLSv13)
+        sec_protocol_options_set_local_identity(tls.securityProtocolOptions, identity)
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true
+        let params = NWParameters(tls: tls, tcp: tcp)
+        params.serviceClass = .interactiveVideo
+        do {
+            secureListener = try NWListener(using: params, on: 9001)
+        } catch {
+            Log.info("secure listener failed: \(error)")
+            return
+        }
+        secureListener?.service = advertisedService
+        secureListener?.newConnectionHandler = { [weak self] conn in
+            guard let self else { conn.cancel(); return }
+            conn.stateUpdateHandler = { [weak self] state in
+                guard let self else { conn.cancel(); return }
+                switch state {
+                case .ready: self.receiveSecureAuth(on: conn)
+                case .failed: conn.cancel()
+                default: break
+                }
+            }
+            conn.start(queue: self.queue)
+        }
+        secureListener?.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready: self.secureListenerHealthy = true
+            case .failed(let error):
+                Log.info("secure listener failed: \(error)")
+                self.secureListenerHealthy = false
+            case .cancelled: self.secureListenerHealthy = false
+            default: break
+            }
+        }
+        secureListener?.start(queue: queue)
+    }
+
+    private func receiveSecureAuth(on conn: NWConnection) {
+        // Authenticate before sending hello or adopting the video session.
+        conn.receive(minimumIncompleteLength: 4, maximumLength: 4) {
+            [weak self] header, _, _, error in
+            guard let self, error == nil, let header, header.count == 4 else {
+                conn.cancel(); return
+            }
+            let count = header.withUnsafeBytes {
+                Int(UInt32(bigEndian: $0.loadUnaligned(as: UInt32.self)))
+            }
+            guard (1...4096).contains(count) else { conn.cancel(); return }
+            conn.receive(minimumIncompleteLength: count, maximumLength: count) {
+                [weak self] data, _, _, error in
+                guard let self, error == nil, let data, data.count == count,
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      obj["type"] as? String == "auth",
+                      let sent = obj["token"] as? String,
+                      let stored = PadBridgePairing.token(),
+                      self.tokensEqual(sent, stored) else {
+                    conn.cancel(); return
+                }
+                self.transport = "WiFi"
+                self.adopt(conn, secure: true)
+            }
+        }
+    }
+
+    private func tokensEqual(_ a: String, _ b: String) -> Bool {
+        let lhs = Array(a.utf8), rhs = Array(b.utf8)
+        guard lhs.count == rhs.count, lhs.count >= 32 else { return false }
+        var difference: UInt8 = 0
+        for i in lhs.indices { difference |= lhs[i] ^ rhs[i] }
+        return difference == 0
+    }
+    #endif
+
     private func startListener() {
         do {
             // noDelay matters most in THIS direction: touch events are tiny
@@ -605,13 +727,23 @@ final class StreamReceiver: ObservableObject {
         }
         // Advertise on the local network so the Mac can discover us for WiFi
         // mode (USB/usbmux connects straight to the port and ignores this).
+        #if os(macOS)
         listener?.service = advertisedService
+        #endif
         listener?.newConnectionHandler = { [weak self] conn in
             guard let self else { return }
             Log.info("new connection from \(String(describing: conn.endpoint))")
             // usbmux-forwarded (cable) connections arrive from loopback;
             // anything else came over the network.
             let peer = String(describing: conn.endpoint)
+            #if os(iOS)
+            guard peer.hasPrefix("127.0.0.1") || peer.hasPrefix("::1") ||
+                  peer.hasPrefix("[::1]") || peer.hasPrefix("localhost") else {
+                Log.info("rejecting non-USB plaintext connection")
+                conn.cancel()
+                return
+            }
+            #endif
             self.transport = (peer.hasPrefix("127.0.0.1") || peer.hasPrefix("::1")
                               || peer.hasPrefix("localhost")) ? "USB" : "WiFi"
             // A Bonjour dial races IPv6 and IPv4 and both handshakes can
@@ -678,7 +810,9 @@ final class StreamReceiver: ObservableObject {
             }
         }
         listener?.start(queue: queue)
+        #if os(macOS)
         startCursorListener()
+        #endif
     }
 
     /// Make `conn` the session: replace any existing connection and reset
@@ -686,10 +820,12 @@ final class StreamReceiver: ObservableObject {
     /// without the cursor port while it proved itself (see the listener), with
     /// the bytes it sent back in `initialData`. Once adopted, the full hello
     /// opens a cursor flow that unambiguously belongs to this session.
-    private func adopt(_ conn: NWConnection, greeted: Bool = false, initialData: Data? = nil) {
+    private func adopt(_ conn: NWConnection, greeted: Bool = false,
+                       initialData: Data? = nil, secure: Bool = false) {
         if greeted { Log.info("newcomer proved itself — adopting it as the session") }
         connection?.cancel()
         connection = conn
+        secureSession = secure
         // The race is decided: rival candidates die here.
         for pending in pendingConnections where pending !== conn { pending.cancel() }
         pendingConnections.removeAll()
@@ -799,6 +935,15 @@ final class StreamReceiver: ObservableObject {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = obj["type"] as? String else { return }
         switch type {
+        #if os(iOS)
+        case "pairOffer":
+            guard transport == "USB", !secureSession, connection?.state == .ready else { return }
+            if PadBridgePairing.install(obj, expectedID: Self.installID) {
+                sendControl(["type": "pairAck", "sha256": obj["sha256"] as? String ?? ""])
+                startSecureListener()
+                Log.info("USB pairing stored in Keychain; TLS listener started")
+            }
+        #endif
         case "pong":
             guard let t1 = obj["t"] as? Double, let mt = obj["mt"] as? Double else { return }
             let t2 = nowMs
@@ -847,6 +992,8 @@ final class StreamReceiver: ObservableObject {
             let macPV = obj["pv"] as? Int ?? WireProtocol.assumedWhenAbsent
             DispatchQueue.main.async {
                 self.macProtocolVersion = macPV
+                self.keyboardForwardingAvailable =
+                    (obj["features"] as? [String])?.contains("keyboard-v1") == true
             }
             if macPV < WireProtocol.minSupportedPeer {
                 let msg = "OpenDisplay on the connecting computer is too old for this \(deviceKind) app. Update it there to reconnect."
@@ -947,8 +1094,12 @@ final class StreamReceiver: ObservableObject {
             "device": deviceKind,
             "id": Self.installID,
             "pv": WireProtocol.version,   // issue #132 — absent on old receivers
+            "features": ["keyboard-v1"],
             "displayMaxFrameRate": displayMaxFrameRate,
         ]
+        #if os(iOS)
+        hello["paired"] = PadBridgePairing.identity() != nil
+        #endif
         let panel = panelOverride ?? PanelAnnouncement(
             pixelsWide: devicePixelsWide, pixelsHigh: devicePixelsHigh, scale: deviceScale)
         hello["panel"] = panel.json
@@ -973,7 +1124,7 @@ final class StreamReceiver: ObservableObject {
         hello["videoCaps"] = videoCaps
         // Additive capability: only offered while the UDP listener is bound,
         // so a sender never dials a port nobody answers on.
-        let announcesCursorPort = includeCursorPort && cursorListenerReady
+        let announcesCursorPort = includeCursorPort && cursorListenerReady && !secureSession
         if announcesCursorPort { hello["cursorPort"] = Int(cursorPort) }
         // Additive: decode ceiling (PROTOCOL.md 6.5) — ask for the full
         // desktop but a stream no larger than this machine can decode.
@@ -1059,6 +1210,18 @@ final class StreamReceiver: ObservableObject {
         var msg: [String: Any] = ["type": "touch", "phase": phase, "x": x, "y": y]
         if let offset = clockOffsetMs { msg["t"] = nowMs + offset }
         sendControl(msg)
+    }
+
+    func sendKey(usage: Int, down: Bool) {
+        guard connected, keyboardForwardingAvailable, keyboardForeground,
+              videoSize != .zero, (0x04...0xe7).contains(usage) else { return }
+        sendControl(["type": "key", "usage": usage, "down": down])
+    }
+
+    func resetKeyboard() {
+        if connected, keyboardForwardingAvailable {
+            sendControl(["type": "keyReset"])
+        }
     }
 
     /// Two-finger scroll: dx/dy in video pixels (natural-scrolling sign).
@@ -1576,6 +1739,7 @@ final class StreamReceiver: ObservableObject {
             self.connected = value
             if !value {
                 self.macProtocolVersion = WireProtocol.assumedWhenAbsent
+                self.keyboardForwardingAvailable = false
             }
         }
         if !value { setStatus("Ready to connect") }

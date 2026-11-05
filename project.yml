@@ -189,7 +189,7 @@ targets:
     info:
       path: iOS/Info.plist
       properties:
-        CFBundleDisplayName: OpenDisplay
+        CFBundleDisplayName: PadBridge Keyboard
         CFBundleIconName: AppIcon
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
@@ -199,8 +199,8 @@ targets:
         # 27 multitasking); the receiver reports whatever window it gets.
         UIRequiresFullScreen: true
         UIRequiresFullScreenIgnoredStartingWithVersion: "27"
-        NSLocalNetworkUsageDescription: OpenDisplay advertises itself on the local network so your Mac can connect over WiFi.
-        NSBonjourServices: ["_opensidecar._tcp"]
+        NSLocalNetworkUsageDescription: PadBridge Keyboard advertises its paired TLS receiver so your Windows computer can connect over Wi-Fi.
+        NSBonjourServices: ["_padbridge-secure._tcp"]
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
@@ -208,6 +208,6 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.ios
+        PRODUCT_BUNDLE_IDENTIFIER: com.padbridge.keyboard.ios
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

@@ -106,6 +106,9 @@ struct ReceiverScreen: View {
         .sheet(isPresented: $showSettings) {
             SettingsView(receiver: model.receiver)
         }
+        .onChange(of: showSettings) { showing in
+            if showing { model.receiver.resetKeyboard() }
+        }
         // Below the force floor → blocking gate. Setter is a no-op: the user
         // cannot dismiss it, only update.
         .fullScreenCover(item: Binding(get: { requiredUpdate }, set: { _ in })) { update in
@@ -130,6 +133,12 @@ struct ReceiverScreen: View {
         }
         .onChange(of: scenePhase) { phase in
             Log.info("scenePhase -> \(String(describing: phase))")
+            if phase != .active {
+                model.receiver.resetKeyboard()
+                model.receiver.keyboardForeground = false
+            } else {
+                model.receiver.keyboardForeground = true
+            }
             switch phase {
             case .active: model.sceneDidActivate()
             case .background: model.sceneDidBackground()
@@ -837,12 +846,59 @@ struct VideoLayerView: UIViewRepresentable {
     func updateUIView(_ uiView: VideoView, context: Context) {
         // videoSize arrives after the format description — re-fit the layers.
         uiView.setNeedsLayout()
+        if receiver.keyboardForeground && uiView.window != nil && !uiView.isFirstResponder {
+            uiView.becomeFirstResponder()
+        }
     }
 
     final class VideoView: UIView {
         weak var receiver: StreamReceiver?
         var metalRenderer: MetalVideoRenderer?
         let inputEngine = InputCaptureEngine()
+
+        override var canBecomeFirstResponder: Bool { true }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            if window != nil && receiver?.keyboardForeground == true {
+                becomeFirstResponder()
+            } else if window == nil {
+                receiver?.resetKeyboard()
+            }
+        }
+
+        private func forward(_ presses: Set<UIPress>, down: Bool) -> Set<UIPress> {
+            guard let receiver, receiver.connected,
+                  receiver.keyboardForwardingAvailable, receiver.keyboardForeground else {
+                return presses
+            }
+            var unhandled = Set<UIPress>()
+            for press in presses {
+                guard let key = press.key else { unhandled.insert(press); continue }
+                let usage = Int(key.keyCode.rawValue)
+                guard (0x04...0xe7).contains(usage) else {
+                    unhandled.insert(press)
+                    continue
+                }
+                receiver.sendKey(usage: usage, down: down)
+            }
+            return unhandled
+        }
+
+        override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+            let unhandled = forward(presses, down: true)
+            if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
+        }
+
+        override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+            let unhandled = forward(presses, down: false)
+            if !unhandled.isEmpty { super.pressesEnded(unhandled, with: event) }
+        }
+
+        override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+            let unhandled = forward(presses, down: false)
+            if !unhandled.isEmpty { super.pressesCancelled(unhandled, with: event) }
+        }
 
         private let cursorLayer: CALayer = {
             let layer = CALayer()
