@@ -47,7 +47,7 @@ struct ReceiverScreen: View {
 
     // Streaming = connected and the video format is known.
     private var isStreaming: Bool {
-        model.receiver.connected && model.receiver.videoSize != .zero
+        !model.sessionPaused && model.receiver.connected && model.receiver.videoSize != .zero
     }
 
     var body: some View {
@@ -71,8 +71,30 @@ struct ReceiverScreen: View {
                         }
                         .allowsHitTesting(false)   // never block touch input
                     }
+                    VStack {
+                        HStack {
+                            Spacer()
+                            Button {
+                                model.endSession()
+                            } label: {
+                                Label("结束副屏", systemImage: "xmark.rectangle")
+                                    .font(.subheadline.bold())
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 10)
+                                    .foregroundStyle(.white)
+                                    .background(.black.opacity(0.68), in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("endSecondScreen")
+                        }
+                        .padding(.top, 42)
+                        .padding(.trailing, 24)
+                        Spacer()
+                    }
                 } else {
-                    IdleView(receiver: model.receiver, showSettings: $showSettings)
+                    IdleView(receiver: model.receiver, showSettings: $showSettings,
+                             sessionPaused: model.sessionPaused, canResume: model.canResume,
+                             resume: model.resumeSession)
                 }
             }
             // The window, not this view: a sheet, the keyboard or the
@@ -155,6 +177,9 @@ struct ReceiverScreen: View {
 struct IdleView: View {
     @ObservedObject var receiver: StreamReceiver
     @Binding var showSettings: Bool
+    let sessionPaused: Bool
+    let canResume: Bool
+    let resume: () -> Void
 
     var body: some View {
         VStack(spacing: 28) {
@@ -166,25 +191,32 @@ struct IdleView: View {
                 .frame(width: 132)
 
             VStack(spacing: 6) {
-                Text("PadBridge Keyboard")
+                Text(sessionPaused ? "副屏已结束" : "PadBridge Keyboard")
                     .font(.largeTitle.bold())
                 HStack(spacing: 8) {
                     Circle()
                         .fill(receiver.connected ? Color.green : Color.orange)
                         .frame(width: 8, height: 8)
-                    Text(receiver.status)
+                    Text(sessionPaused ? (canResume ? "已断开电脑" : "正在断开…") : receiver.status)
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
             }
 
             VStack(alignment: .leading, spacing: 14) {
-                HintRow("Connect USB and open PadBridge on Windows to pair",
-                        systemImage: "cable.connector")
-                HintRow("After USB pairing, select this \(deviceKind) in PadBridge Wi-Fi",
-                        systemImage: "wifi")
-                HintRow("Keep this app open. Streaming starts automatically.",
-                        systemImage: "play.circle")
+                if sessionPaused {
+                    HintRow("Windows 副屏已停止；妙控键盘恢复控制 iPad。",
+                            systemImage: "display")
+                    HintRow("如需再次使用副屏，请点击下方按钮。",
+                            systemImage: "play.circle")
+                } else {
+                    HintRow("Connect USB and open PadBridge on Windows to pair",
+                            systemImage: "cable.connector")
+                    HintRow("After USB pairing, select this \(deviceKind) in PadBridge Wi-Fi",
+                            systemImage: "wifi")
+                    HintRow("Keep this app open. Streaming starts automatically.",
+                            systemImage: "play.circle")
+                }
             }
             .font(.subheadline)
             .padding(20)
@@ -193,6 +225,13 @@ struct IdleView: View {
                         in: RoundedRectangle(cornerRadius: 16))
 
             Spacer()
+
+            if sessionPaused {
+                Button("重新允许连接", action: resume)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!canResume)
+                    .accessibilityIdentifier("resumeSecondScreen")
+            }
 
             Button {
                 showSettings = true
@@ -488,6 +527,8 @@ private struct DeviceNameField: View {
 @MainActor
 final class ReceiverModel: ObservableObject {
     let receiver: StreamReceiver
+    @Published private(set) var sessionPaused = false
+    @Published private(set) var canResume = false
     private let decodesHEVC: Bool
     private var started = false
     private var cancellables = Set<AnyCancellable>()
@@ -575,6 +616,24 @@ final class ReceiverModel: ObservableObject {
         receiver.start(port: 9000)
     }
 
+    func endSession() {
+        guard !sessionPaused else { return }
+        sessionPaused = true
+        canResume = false
+        receiver.resetKeyboard()
+        receiver.stop { [weak self] in
+            DispatchQueue.main.async { self?.canResume = true }
+        }
+    }
+
+    func resumeSession() {
+        guard sessionPaused && canResume else { return }
+        sessionPaused = false
+        canResume = false
+        receiver.keyboardForeground = true
+        receiver.start(port: 9000)
+    }
+
     // MARK: - Lock vs app switch vs app quit
 
     // A plain app switch keeps the session (and the Mac's virtual display,
@@ -589,6 +648,7 @@ final class ReceiverModel: ObservableObject {
     private var backgroundToken: UIBackgroundTaskIdentifier = .invalid
 
     func sceneDidBackground() {
+        guard !sessionPaused else { return }
         // Known limitation: lock detection rides the protected-data signal,
         // which only fires when a passcode is set AND "Require Passcode" is
         // Immediately (the Face ID default). Other configurations make a
@@ -607,6 +667,7 @@ final class ReceiverModel: ObservableObject {
 
     func sceneDidActivate() {
         endBackgroundAssertion()
+        guard !sessionPaused else { return }
         receiver.setRenderingPaused(false)
         // A fold while the app was in the background: announce the screen it
         // came back on before a redialing Mac rebuilds for the old one.
