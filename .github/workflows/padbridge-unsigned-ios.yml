@@ -27,6 +27,8 @@ jobs:
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -derivedDataPath build/ios \
+            MARKETING_VERSION=0.3.4.6 \
+            CURRENT_PROJECT_VERSION=2 \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY=""
